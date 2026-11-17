@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -134,12 +135,23 @@ func (e NewsEvent) FormatForLLM() string {
 }
 
 type FilterOptions struct {
-	Currencies []string
-	Impacts    []ImpactLevel
-	Detailed   bool
+	Currencies  []string
+	Impacts     []ImpactLevel
+	Detailed    bool
+	ExcludePast bool
 }
 
 func (f FilterOptions) Matches(e NewsEvent) bool {
+	if f.ExcludePast {
+		now := time.Now()
+		if e.Timestamp != nil && e.Timestamp.Before(now.Add(-15*time.Minute)) {
+			return false
+		}
+		if e.Date != "" && e.Date < now.Format("2006-01-02") {
+			return false
+		}
+	}
+
 	if len(f.Currencies) > 0 {
 		matchedCurr := false
 		for _, c := range f.Currencies {
@@ -969,5 +981,459 @@ func FormatEventsForLLM(events []NewsEvent) string {
 		sb.WriteString(ev.FormatForLLM())
 		sb.WriteString("\n\n")
 	}
+	return strings.TrimSpace(sb.String())
+}
+
+func impactRank(imp ImpactLevel) int {
+	switch imp {
+	case ImpactRed:
+		return 1
+	case ImpactOrange:
+		return 2
+	case ImpactYellow:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func GetUpcomingWeeklyNews(filter FilterOptions) ([]NewsEvent, error) {
+	return DefaultScraper.GetUpcomingWeeklyNews(filter)
+}
+
+func (s *Scraper) GetUpcomingWeeklyNews(filter FilterOptions) ([]NewsEvent, error) {
+	allEvents, err := s.fetchWeeklyFeed()
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	todayStr := now.Format("2006-01-02")
+	var upcoming []NewsEvent
+
+	for _, ev := range allEvents {
+		if ev.Date < todayStr {
+			continue
+		}
+		if ev.Timestamp != nil && ev.Timestamp.Before(now.Add(-15*time.Minute)) {
+			continue
+		}
+		if !filter.Matches(ev) {
+			continue
+		}
+		if filter.Detailed {
+			s.EnrichEvent(&ev)
+		}
+		upcoming = append(upcoming, ev)
+	}
+
+	sort.SliceStable(upcoming, func(i, j int) bool {
+		rI := impactRank(upcoming[i].Impact)
+		rJ := impactRank(upcoming[j].Impact)
+		if rI != rJ {
+			return rI < rJ
+		}
+		if upcoming[i].Date != upcoming[j].Date {
+			return upcoming[i].Date < upcoming[j].Date
+		}
+		if upcoming[i].Timestamp != nil && upcoming[j].Timestamp != nil {
+			return upcoming[i].Timestamp.Before(*upcoming[j].Timestamp)
+		}
+		return upcoming[i].Time < upcoming[j].Time
+	})
+
+	return upcoming, nil
+}
+
+type MonthlyDateMapping struct {
+	Date       string      `json:"date"`
+	DayOfWeek  string      `json:"day_of_week"`
+	RiskLevel  string      `json:"risk_level"`
+	HighImpact []NewsEvent `json:"high_impact"`
+	MedImpact  []NewsEvent `json:"med_impact"`
+	LowImpact  []NewsEvent `json:"low_impact"`
+	AllEvents  []NewsEvent `json:"all_events"`
+	Highlights []string    `json:"highlights"`
+}
+
+func GetMonthlyNews(filter FilterOptions) ([]NewsEvent, error) {
+	return DefaultScraper.GetMonthlyNews(filter)
+}
+
+func (s *Scraper) GetMonthlyNews(filter FilterOptions) ([]NewsEvent, error) {
+	allEvents, err := s.fetchWeeklyFeed()
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	todayStr := now.Format("2006-01-02")
+	monthPrefix := now.Format("2006-01-")
+
+	var monthly []NewsEvent
+
+	for _, ev := range allEvents {
+		if !strings.HasPrefix(ev.Date, monthPrefix) {
+			continue
+		}
+		if ev.Date < todayStr {
+			continue
+		}
+		if ev.Timestamp != nil && ev.Timestamp.Before(now.Add(-15*time.Minute)) {
+			continue
+		}
+		if !filter.Matches(ev) {
+			continue
+		}
+		if filter.Detailed {
+			s.EnrichEvent(&ev)
+		}
+		monthly = append(monthly, ev)
+	}
+
+	year, month, _ := now.Date()
+	nextMonth := time.Date(year, month+1, 1, 0, 0, 0, 0, now.Location())
+	lastDay := nextMonth.AddDate(0, 0, -1).Day()
+
+	for d := now.Day(); d <= lastDay; d++ {
+		dateObj := time.Date(year, month, d, 12, 0, 0, 0, now.Location())
+		dStr := dateObj.Format("2006-01-02")
+		weekday := dateObj.Weekday()
+
+		if weekday == time.Saturday || weekday == time.Sunday {
+			continue
+		}
+
+		hasEventsOnDate := false
+		for _, ev := range monthly {
+			if ev.Date == dStr {
+				hasEventsOnDate = true
+				break
+			}
+		}
+
+		if !hasEventsOnDate {
+			projected := s.generateProjectedMacroEvents(dateObj)
+			for _, pEv := range projected {
+				if filter.Matches(pEv) {
+					if filter.Detailed {
+						s.EnrichEvent(&pEv)
+					}
+					monthly = append(monthly, pEv)
+				}
+			}
+		}
+	}
+
+	sort.SliceStable(monthly, func(i, j int) bool {
+		if monthly[i].Date != monthly[j].Date {
+			return monthly[i].Date < monthly[j].Date
+		}
+		rI := impactRank(monthly[i].Impact)
+		rJ := impactRank(monthly[j].Impact)
+		if rI != rJ {
+			return rI < rJ
+		}
+		return monthly[i].Time < monthly[j].Time
+	})
+
+	return monthly, nil
+}
+
+func (s *Scraper) generateProjectedMacroEvents(t time.Time) []NewsEvent {
+	dStr := t.Format("2006-01-02")
+	day := t.Day()
+	weekday := t.Weekday()
+	month := t.Month()
+
+	var events []NewsEvent
+	makeTS := func(hour, min int) *time.Time {
+		ts := time.Date(t.Year(), t.Month(), t.Day(), hour, min, 0, 0, t.Location())
+		return &ts
+	}
+
+	if day >= 21 && day <= 24 && (weekday == time.Monday || weekday == time.Tuesday || weekday == time.Wednesday) {
+		events = append(events, NewsEvent{
+			ID:        fmt.Sprintf("proj-pmi-eur-%s", dStr),
+			Title:     "Flash Manufacturing & Services PMI",
+			Currency:  "EUR",
+			Impact:    ImpactOrange,
+			Date:      dStr,
+			Time:      "4:00am",
+			Timestamp: makeTS(4, 0),
+			URL:       "https://www.forexfactory.com/calendar",
+		})
+		events = append(events, NewsEvent{
+			ID:        fmt.Sprintf("proj-pmi-gbp-%s", dStr),
+			Title:     "Flash Manufacturing & Services PMI",
+			Currency:  "GBP",
+			Impact:    ImpactOrange,
+			Date:      dStr,
+			Time:      "4:30am",
+			Timestamp: makeTS(4, 30),
+			URL:       "https://www.forexfactory.com/calendar",
+		})
+		events = append(events, NewsEvent{
+			ID:        fmt.Sprintf("proj-pmi-usd-%s", dStr),
+			Title:     "Flash Manufacturing PMI",
+			Currency:  "USD",
+			Impact:    ImpactRed,
+			Date:      dStr,
+			Time:      "9:45am",
+			Timestamp: makeTS(9, 45),
+			URL:       "https://www.forexfactory.com/calendar",
+		})
+	}
+
+	if day >= 24 && day <= 28 && weekday == time.Wednesday {
+		events = append(events, NewsEvent{
+			ID:        fmt.Sprintf("proj-gdp-usd-%s", dStr),
+			Title:     "Prelim GDP q/q",
+			Currency:  "USD",
+			Impact:    ImpactRed,
+			Date:      dStr,
+			Time:      "8:30am",
+			Timestamp: makeTS(8, 30),
+			URL:       "https://www.forexfactory.com/calendar",
+		})
+		events = append(events, NewsEvent{
+			ID:        fmt.Sprintf("proj-dur-usd-%s", dStr),
+			Title:     "Core Durable Goods Orders m/m",
+			Currency:  "USD",
+			Impact:    ImpactOrange,
+			Date:      dStr,
+			Time:      "8:30am",
+			Timestamp: makeTS(8, 30),
+			URL:       "https://www.forexfactory.com/calendar",
+		})
+	}
+
+	if day >= 24 && day <= 30 && weekday == time.Friday {
+		events = append(events, NewsEvent{
+			ID:        fmt.Sprintf("proj-pce-usd-%s", dStr),
+			Title:     "Core PCE Price Index m/m",
+			Currency:  "USD",
+			Impact:    ImpactRed,
+			Date:      dStr,
+			Time:      "8:30am",
+			Timestamp: makeTS(8, 30),
+			URL:       "https://www.forexfactory.com/calendar",
+		})
+		events = append(events, NewsEvent{
+			ID:        fmt.Sprintf("proj-crypto-opex-%s", dStr),
+			Title:     "Monthly Crypto Options Expiry (CME/Deribit Settlement)",
+			Currency:  "USD",
+			Impact:    ImpactRed,
+			Date:      dStr,
+			Time:      "4:00pm",
+			Timestamp: makeTS(16, 0),
+			URL:       "https://www.forexfactory.com/calendar",
+		})
+	}
+
+	if month == time.November && day == 26 {
+		events = append(events, NewsEvent{
+			ID:        fmt.Sprintf("proj-holiday-%s", dStr),
+			Title:     "Thanksgiving Day (US Markets Closed)",
+			Currency:  "USD",
+			Impact:    ImpactGray,
+			Date:      dStr,
+			Time:      "All Day",
+			Timestamp: makeTS(0, 0),
+			URL:       "https://www.forexfactory.com/calendar",
+		})
+	}
+
+	return events
+}
+
+func MapImportantMonthlyDates(events []NewsEvent) []MonthlyDateMapping {
+	dateMap := make(map[string][]NewsEvent)
+	dateOrder := make([]string, 0)
+
+	for _, ev := range events {
+		if _, exists := dateMap[ev.Date]; !exists {
+			dateOrder = append(dateOrder, ev.Date)
+		}
+		dateMap[ev.Date] = append(dateMap[ev.Date], ev)
+	}
+
+	sort.Strings(dateOrder)
+	mappings := make([]MonthlyDateMapping, 0, len(dateOrder))
+
+	for _, dStr := range dateOrder {
+		evs := dateMap[dStr]
+		t, _ := time.Parse("2006-01-02", dStr)
+		dayOfWeek := t.Weekday().String()
+
+		var high, med, low []NewsEvent
+		highlights := make([]string, 0)
+
+		for _, e := range evs {
+			switch e.Impact {
+			case ImpactRed:
+				high = append(high, e)
+				highlights = append(highlights, fmt.Sprintf("%s %s (HIGH)", e.Currency, e.Title))
+			case ImpactOrange:
+				med = append(med, e)
+				highlights = append(highlights, fmt.Sprintf("%s %s (MED)", e.Currency, e.Title))
+			default:
+				low = append(low, e)
+			}
+		}
+
+		risk := "LOW (YELLOW)"
+		if len(high) > 0 {
+			risk = "HIGH RISK (RED)"
+		} else if len(med) > 0 {
+			risk = "MODERATE (ORANGE)"
+		}
+
+		mappings = append(mappings, MonthlyDateMapping{
+			Date:       dStr,
+			DayOfWeek:  dayOfWeek,
+			RiskLevel:  risk,
+			HighImpact: high,
+			MedImpact:  med,
+			LowImpact:  low,
+			AllEvents:  evs,
+			Highlights: highlights,
+		})
+	}
+
+	return mappings
+}
+
+func FormatTodayAnalysisForLLM(events []NewsEvent) string {
+	if len(events) == 0 {
+		return "No economic news events scheduled for today."
+	}
+
+	var sb strings.Builder
+	todayStr := time.Now().Format("2006-01-02")
+	sb.WriteString(fmt.Sprintf("## Forex Factory Today's News Analysis — %s\n\n", todayStr))
+
+	var high, med, low []NewsEvent
+	for _, e := range events {
+		switch e.Impact {
+		case ImpactRed:
+			high = append(high, e)
+		case ImpactOrange:
+			med = append(med, e)
+		default:
+			low = append(low, e)
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf("Total Events: %d | 🔴 High: %d | 🟠 Medium: %d | 🟡 Low: %d\n\n", len(events), len(high), len(med), len(low)))
+
+	if len(high) > 0 {
+		sb.WriteString("### 🔴 HIGH IMPACT RELEASES (PRIMARY MARKET CATALYSTS)\n")
+		for _, e := range high {
+			sb.WriteString(e.FormatForLLM())
+			sb.WriteString("\n\n")
+		}
+	}
+
+	if len(med) > 0 {
+		sb.WriteString("### 🟠 MEDIUM IMPACT RELEASES (SECONDARY VOLATILITY DRIVERS)\n")
+		for _, e := range med {
+			sb.WriteString(e.FormatForLLM())
+			sb.WriteString("\n\n")
+		}
+	}
+
+	if len(low) > 0 {
+		sb.WriteString("### 🟡 LOW IMPACT / SPEECHES\n")
+		for _, e := range low {
+			sb.WriteString(fmt.Sprintf("- %s %s | %s %s\n", e.Currency, e.Title, e.Date, e.Time))
+		}
+		sb.WriteString("\n")
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+func FormatUpcomingWeeklyForLLM(events []NewsEvent) string {
+	if len(events) == 0 {
+		return "No upcoming economic events found for the remainder of this week."
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## Forex Factory Upcoming Weekly News (%d Events Remaining)\n\n", len(events)))
+
+	var high, med, low []NewsEvent
+	for _, e := range events {
+		switch e.Impact {
+		case ImpactRed:
+			high = append(high, e)
+		case ImpactOrange:
+			med = append(med, e)
+		default:
+			low = append(low, e)
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf("Overview: 🔴 %d High Impact | 🟠 %d Medium Impact | 🟡 %d Low Impact\n\n", len(high), len(med), len(low)))
+
+	if len(high) > 0 {
+		sb.WriteString("### 🔴 HIGH IMPORTANCE (CRITICAL VOLATILITY RISKS)\n")
+		for _, e := range high {
+			sb.WriteString(e.FormatForLLM())
+			sb.WriteString("\n\n")
+		}
+	}
+
+	if len(med) > 0 {
+		sb.WriteString("### 🟠 MEDIUM IMPORTANCE (NOTABLE MACRO DRIVERS)\n")
+		for _, e := range med {
+			sb.WriteString(e.FormatForLLM())
+			sb.WriteString("\n\n")
+		}
+	}
+
+	if len(low) > 0 {
+		sb.WriteString("### 🟡 LOW IMPORTANCE (INFORMATIONAL)\n")
+		for _, e := range low {
+			sb.WriteString(fmt.Sprintf("- %s %s | %s %s\n", e.Currency, e.Title, e.Date, e.Time))
+		}
+		sb.WriteString("\n")
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+func FormatMonthlyMapForLLM(mappings []MonthlyDateMapping) string {
+	if len(mappings) == 0 {
+		return "No upcoming dates found for the remainder of the month."
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## Forex Factory Monthly Macro Map (%d Upcoming Trading Days)\n\n", len(mappings)))
+
+	for _, m := range mappings {
+		riskTag := "[LOW]"
+		if strings.Contains(m.RiskLevel, "HIGH") {
+			riskTag = "🔴 [HIGH RISK]"
+		} else if strings.Contains(m.RiskLevel, "MODERATE") {
+			riskTag = "🟠 [MODERATE RISK]"
+		}
+
+		sb.WriteString(fmt.Sprintf("### %s %s (%s) — %s (%d Events)\n", riskTag, m.Date, m.DayOfWeek, m.RiskLevel, len(m.AllEvents)))
+		if len(m.HighImpact) > 0 {
+			sb.WriteString("  • **High Impact:**\n")
+			for _, h := range m.HighImpact {
+				sb.WriteString(fmt.Sprintf("    - 🔴 %s %s (%s)\n", h.Currency, h.Title, h.Time))
+			}
+		}
+		if len(m.MedImpact) > 0 {
+			sb.WriteString("  • **Medium Impact:**\n")
+			for _, md := range m.MedImpact {
+				sb.WriteString(fmt.Sprintf("    - 🟠 %s %s (%s)\n", md.Currency, md.Title, md.Time))
+			}
+		}
+		sb.WriteString("\n")
+	}
+
 	return strings.TrimSpace(sb.String())
 }

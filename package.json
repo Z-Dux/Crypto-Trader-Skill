@@ -1,0 +1,37 @@
+{
+  "name": "crypto-trader-skill",
+  "version": "1.0.0",
+  "description": "Institutional crypto trading skill with live WebSocket tape, indicator math, and Forex Factory macroeconomic analysis for AI agents (Antigravity, Claude Code, Cursor, Codex).",
+  "main": "bin/install.js",
+  "bin": {
+    "crypto-trader-skill": "./bin/install.js"
+  },
+  "files": [
+    "bin",
+    "skills",
+    "agents",
+    "cmd",
+    "internal",
+    "plugin.json",
+    "go.mod",
+    "go.sum",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node bin/install.js",
+    "install-skills": "node bin/install.js"
+  },
+  "keywords": [
+    "crypto-trader",
+    "antigravity",
+    "claude-code",
+    "skills",
+    "agent-skills",
+    "forex-factory",
+    "macro-news",
+    "trading-bot",
+    "ccxt"
+  ],
+  "author": "Crypto Trader Skill Team",
+  "license": "MIT"
+}

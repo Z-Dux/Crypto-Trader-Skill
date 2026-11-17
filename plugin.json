@@ -1,0 +1,6 @@
+{
+  "name": "crypto-trader-skill",
+  "version": "1.0.0",
+  "description": "Institutional crypto trading skill with live WebSocket tape, indicator math (EMA, RSI, MACD, ADX, ATR, CVD, VPVR, Fractals, FVGs), and Forex Factory macroeconomic analysis (/news-analysis, /news-weekly, /news-monthly).",
+  "author": "Crypto Trader Skill Team"
+}
